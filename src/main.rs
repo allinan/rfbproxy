@@ -295,6 +295,13 @@ async fn main() -> Result<()> {
                 .takes_value(true)
                 .help("A JSON-encoded mapping of key IDs to base64-encoded ed25519 public keys"),
         )
+        .arg(
+            clap::Arg::with_name("allow")
+                .long("allow")
+                .value_name("IP")
+                .help("The client ip that is allowed to connect to rfbproxy")
+                .takes_value(true),
+        )
         .get_matches();
 
     if matches.value_of("replid").is_some() != matches.value_of("pubkeys").is_some() {
@@ -361,7 +368,14 @@ async fn main() -> Result<()> {
         log::info!("Listening on: {}", local_addr);
 
         while let Ok((raw_stream, remote_addr)) = listener.accept().await {
-            let ws_stream = tokio_tungstenite::accept_hdr_async(
+            // check if remote ip is allowed to connect
+            if matches.value_of("allow").is_some() {
+                if remote_addr.ip().to_string() != matches.value_of("allow").unwrap().to_string() {
+                    log::error!("{} not allowed", remote_addr);
+                    continue;
+                }
+            }
+            let ws_stream = match tokio_tungstenite::accept_hdr_async(
                 raw_stream,
                 |request: &tungstenite::handshake::server::Request,
                  mut response: tungstenite::handshake::server::Response| {
@@ -372,7 +386,14 @@ async fn main() -> Result<()> {
                     Ok(response)
                 },
             )
-            .await?;
+            .await
+            {
+                Ok(ws_stream) => ws_stream,
+                Err(e) => {
+                    log::error!("error in websocket upgrade: {:#}", e);
+                    continue;
+                }
+            };
             let authentication = authentication.clone();
             tokio::spawn(async move {
                 log::info!("Incoming TCP connection from: {}", remote_addr);
