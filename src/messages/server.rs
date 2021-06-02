@@ -144,6 +144,8 @@ impl Message {
                             check_message_length(length)?;
                             skip(src, length)
                         }
+                        // DesktopSize Pseudo-encoding
+                        -223 => Ok(()),
                         // LastRect Pseudo-encoding
                         -224 => break,
                         // Cursor Pseudo-encoding
