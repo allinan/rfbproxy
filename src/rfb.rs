@@ -10,11 +10,11 @@ use crate::messages::{client, server};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, Result};
 
 use bytes::{Buf, BytesMut};
 
-use futures::{SinkExt, StreamExt};
+// use futures::{/* SinkExt,  */StreamExt};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{mpsc, oneshot};
 
@@ -36,7 +36,7 @@ pub struct RfbConnection {
 impl RfbConnection {
     pub async fn new<Stream>(
         mut stream: tokio::net::TcpStream,
-        ws_stream: &mut tokio_tungstenite::WebSocketStream<Stream>,
+        ws_stream: &mut tokio::net::TcpStream,
         server_tx: mpsc::Sender<Vec<u8>>,
         client_tx: mpsc::Sender<Vec<u8>>,
     ) -> Result<RfbConnection>
@@ -44,27 +44,25 @@ impl RfbConnection {
         Stream: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
     {
         let mut buf = [0u8; 1024];
-
+        let mut remote_buf = [0u8; 1024];
         // ClientInit
-        match ws_stream.next().await {
-            Some(msg) => match msg.context("bad ClientInit handshake")? {
-                tokio_tungstenite::tungstenite::protocol::Message::Binary(payload) => {
-                    log::debug!("->: {:?}", &payload);
-                    stream.write_all(&payload).await?;
-                }
-                unexpected_msg => bail!("unexpected message {:?}", unexpected_msg),
-            },
-            None => bail!("missing ClientInit handshake"),
+        let m = ws_stream.read(&mut remote_buf).await?;
+        log::debug!("<-: {:?}", &remote_buf[0..m]);
+        if m != 1 {
+            bail!(
+                "unexpected clientinit length. got {}, expected 1",
+                m
+            );
         }
+        stream.write_all(&remote_buf[0..m]).await?;
+
 
         // ServerInit handshake.
         let n = stream.read(&mut buf).await?;
         let pixel_format = messages::PixelFormat::new(&buf[4..20]);
         log::debug!("<-: {:?}", pixel_format);
         ws_stream
-            .send(tokio_tungstenite::tungstenite::protocol::Message::Binary(
-                buf[0..n].to_vec(),
-            ))
+            .write_all(&buf[0..n])
             .await?;
 
         log::debug!("\n--: Handshake finished\n");

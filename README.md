@@ -1,3 +1,8 @@
+# Modified
+Fork from https://github.com/replit4/rfbproxy, Thanks for such a cool project!
+We need to use websockify to connect to rfbproxy, so modify it to use Tcp socket connection instead of websocket.
+Some instructions: https://www.dadesktop.com/doc/creating-template-supporting-audio .
+
 # rfbproxy
 
 An RFB proxy that enables WebSockets and audio.

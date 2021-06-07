@@ -10,23 +10,16 @@ mod auth;
 mod messages;
 mod rfb;
 
-use std::collections::HashMap;
-use std::net::SocketAddr;
+
 use std::sync::Arc;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{/* bail,  */Context, Result};
 
-use futures::{SinkExt, StreamExt};
-
-use hyper::{Body, Request, Response, Server};
-
-use path_clean::PathClean;
+// use futures::{SinkExt, StreamExt};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
-use tokio_tungstenite::tungstenite;
-use tokio_tungstenite::tungstenite::protocol::Message;
 
 /// The protobuf definitions.
 mod api {
@@ -36,19 +29,29 @@ mod api {
 /// Forwards the data between `socket` and `ws_stream`. Doesn't do anything with the bytes.
 async fn forward_streams<Stream>(
     mut socket: TcpStream,
-    ws_stream: tokio_tungstenite::WebSocketStream<Stream>,
+    mut ws_stream: TcpStream,
 ) -> Result<()>
 where
     Stream: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
-    let (mut wws, mut rws) = ws_stream.split();
+    let (mut rws, mut wws) = ws_stream.split();
     let (mut rs, mut ws) = socket.split();
 
     let client_to_server = async move {
-        while let Some(msg) = rws.next().await {
-            if let Ok(Message::Binary(payload)) = msg {
-                if let Err(err) = ws.write_all(&payload).await {
-                    log::error!("failed to write a message to the server: {:#}", err);
+        let mut buffer = [0u8; 1024];
+        loop {
+            match rws.read(&mut buffer[..]).await {
+                Ok(0) => {
+                    break;
+                }
+                Ok(n) => {
+                    if let Err(err) = ws.write_all(&buffer[..n]).await {
+                        log::error!("failed to write a message to the server: {:#}", err);
+                        break;
+                    }
+                }
+                Err(err) => {
+                    log::error!("failed to read a message from the client: {:#}", err);
                     break;
                 }
             }
@@ -67,7 +70,7 @@ where
                     break;
                 }
                 Ok(n) => {
-                    if let Err(err) = wws.send(Message::Binary((&buffer[..n]).to_vec())).await {
+                    if let Err(err) = wws.write_all(&buffer[..n]).await {
                         log::error!("failed to write a message to the client: {:#}", err);
                         break;
                     }
@@ -80,7 +83,7 @@ where
         }
 
         log::info!("server disconnected");
-        wws.close().await?;
+        wws.shutdown().await?;
         Ok::<(), anyhow::Error>(())
     };
 
@@ -95,7 +98,7 @@ where
 /// data.
 async fn handle_connection<Stream>(
     rfb_addr: std::net::SocketAddr,
-    mut ws_stream: tokio_tungstenite::WebSocketStream<Stream>,
+    mut ws_stream: tokio::net::TcpStream,
     authentication: &auth::RfbAuthentication,
     enable_audio: bool,
 ) -> Result<()>
@@ -103,38 +106,35 @@ where
     Stream: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send,
 {
     let mut socket = TcpStream::connect(rfb_addr).await?;
+    socket.set_nodelay(true).expect("set_nodelay call failed");
+
     auth::authenticate(authentication, &mut socket, &mut ws_stream).await?;
 
     if !enable_audio {
-        return forward_streams(socket, ws_stream).await;
+        return forward_streams::<Stream>(socket, ws_stream).await;
     }
-    let (server_tx, mut server_rx) = mpsc::channel(2);
+    let (server_tx, _server_rx) = mpsc::channel(2);
     let (client_tx, mut client_rx) = mpsc::channel(2);
-    let mut conn = rfb::RfbConnection::new(socket, &mut ws_stream, server_tx, client_tx).await?;
+    let mut conn = rfb::RfbConnection::new::<Stream>(socket, &mut ws_stream, server_tx, client_tx).await?;
 
-    let (mut wws, mut rws) = ws_stream.split();
+    let (mut rws, mut wws) = ws_stream.split();
     let (mut rs, mut ws) = conn.split();
 
     let client_to_server = async {
+        let mut buffer = [0u8; 1024];
         loop {
-            let payload = tokio::select! {
-                Some(payload) = server_rx.recv() => Some(payload),
-                Some(msg) = rws.next() => {
-                    match msg.context("failed to read client-to-server message")? {
-                        Message::Binary(payload) => Some(payload),
-                        Message::Close(_) => break,
-                        msg => {
-                            log::debug!("    ->: Received a message {:?}", msg);
-                            None
-                        }
+            match rws.read(&mut buffer[..]).await {
+                Ok(0) => {
+                    break;
+                }
+                Ok(n) => {
+                    if let Err(err) = ws.write_all(&buffer[..n]).await {
+                        log::error!("failed to write a message to the server: {:#}", err);
+                        break;
                     }
-                },
-                else => break,
-            };
-
-            if let Some(payload) = payload {
-                if let Err(err) = ws.write_all(&payload).await {
-                    log::error!("failed to write message: {:#}", err);
+                }
+                Err(err) => {
+                    log::error!("failed to read a message from the client: {:#}", err);
                     break;
                 }
             }
@@ -162,11 +162,11 @@ where
             };
 
             if let Some(payload) = payload {
-                wws.send(Message::Binary(payload)).await?;
+                wws.write_all(&payload).await?;
             }
         }
         log::info!("server disconnected");
-        wws.close().await?;
+        wws.shutdown().await?;
         Ok::<(), anyhow::Error>(())
     };
 
@@ -177,76 +177,6 @@ where
     Ok(())
 }
 
-/// Handles HTTP requests. Will serve any files in the current working directory, and the RFB
-/// websocket in `/ws`.
-async fn handle_request(
-    rfb_addr: std::net::SocketAddr,
-    mut req: Request<Body>,
-    remote_addr: SocketAddr,
-    authentication: Arc<auth::RfbAuthentication>,
-    enable_audio: bool,
-) -> Result<Response<Body>> {
-    // Clean the path so that it can't be used to access files outside the current working
-    // directory.
-    *req.uri_mut() = {
-        let uri = req.uri();
-        let clean_path = String::from(
-            std::path::PathBuf::from(uri.path())
-                .clean()
-                .to_str()
-                .with_context(|| format!("failed to clean path: {:?}", uri.path()))?,
-        );
-
-        let mut builder = http::uri::Builder::new();
-        if let Some(scheme) = uri.scheme() {
-            builder = builder.scheme(scheme.as_str());
-        }
-        if let Some(authority) = uri.authority() {
-            builder = builder.authority(authority.as_str());
-        }
-        if let Some(query) = uri.query() {
-            builder = builder.path_and_query(format!("{}?{}", clean_path, query));
-        } else {
-            builder = builder.path_and_query(clean_path);
-        }
-        builder.build()?
-    };
-
-    if req.uri().path() == "/ws" {
-        if !hyper_tungstenite::is_upgrade_request(&req) {
-            log::info!("Not an upgrade request");
-            return Ok(http::response::Builder::new()
-                .status(http::StatusCode::NOT_FOUND)
-                .body(Body::empty())
-                .expect("unable to build response"));
-        }
-
-        let (response, websocket) = hyper_tungstenite::upgrade(req, None)?;
-
-        tokio::spawn(async move {
-            log::info!("Incoming TCP connection from: {}", remote_addr);
-
-            let ws_stream = match websocket.await {
-                Ok(ws_stream) => ws_stream,
-                Err(e) => {
-                    log::error!("error in websocket upgrade: {:#}", e);
-                    return;
-                }
-            };
-            if let Err(e) =
-                handle_connection(rfb_addr, ws_stream, &authentication, enable_audio).await
-            {
-                log::error!("error in websocket connection: {:#}", e);
-            }
-            log::info!("{} disconnected", remote_addr);
-        });
-        return Ok(response);
-    }
-
-    Ok(hyper_staticfile::Static::new(std::path::Path::new("./"))
-        .serve(req)
-        .await?)
-}
 
 #[doc(hidden)]
 #[tokio::main]
@@ -272,28 +202,9 @@ async fn main() -> Result<()> {
                 .takes_value(true),
         )
         .arg(
-            clap::Arg::with_name("http-server")
-                .long("http-server")
-                .help(
-                "Whether a normal HTTP server will start to serve the current directory's contents",
-            ),
-        )
-        .arg(
             clap::Arg::with_name("enable-audio")
                 .long("enable-audio")
                 .help("Whether the muxer will support audio muxing or be a simple WebSocket proxy"),
-        )
-        .arg(
-            clap::Arg::with_name("replid")
-                .long("replid")
-                .takes_value(true)
-                .help("The ID of the Repl. Used for authentication"),
-        )
-        .arg(
-            clap::Arg::with_name("pubkeys")
-                .long("pubkeys")
-                .takes_value(true)
-                .help("A JSON-encoded mapping of key IDs to base64-encoded ed25519 public keys"),
         )
         .arg(
             clap::Arg::with_name("allow")
@@ -303,10 +214,6 @@ async fn main() -> Result<()> {
                 .takes_value(true),
         )
         .get_matches();
-
-    if matches.value_of("replid").is_some() != matches.value_of("pubkeys").is_some() {
-        bail!("--replid and --pubkeys must be passed together");
-    }
 
     // Create the event loop and TCP listener we'll accept connections on.
     let local_addr = matches
@@ -318,18 +225,7 @@ async fn main() -> Result<()> {
         .parse()?;
     let enable_audio = matches.is_present("enable-audio")
         || std::env::var("VNC_ENABLE_EXPERIMENTAL_AUDIO").unwrap_or_else(|_| String::new()) != "";
-    let authentication = if matches.value_of("replid").is_some() {
-        let mut pubkeys_base64: HashMap<String, String> =
-            serde_json::from_str(matches.value_of("pubkeys").unwrap())?;
-        let pubkeys = pubkeys_base64
-            .drain()
-            .map(|(keyid, pubkey)| Ok((keyid, base64::decode(pubkey)?)))
-            .collect::<std::result::Result<HashMap<String, Vec<u8>>, base64::DecodeError>>()?;
-        Arc::new(auth::RfbAuthentication::Replit {
-            replid: matches.value_of("replid").unwrap().to_string(),
-            pubkeys,
-        })
-    } else if enable_audio {
+    let authentication = if enable_audio {
         Arc::new(auth::RfbAuthentication::Passthrough)
     } else {
         // If both audio and the replit authentications are disabled, we can let the server and
@@ -338,74 +234,34 @@ async fn main() -> Result<()> {
         Arc::new(auth::RfbAuthentication::Null)
     };
 
-    if matches.is_present("http-server") {
-        let server = Server::bind(&local_addr.parse()?).serve(hyper::service::make_service_fn(
-            |conn: &hyper::server::conn::AddrStream| {
-                let remote_addr = conn.remote_addr();
-                let authentication = authentication.clone();
-                async move {
-                    Ok::<_, hyper::Error>(hyper::service::service_fn(move |req: Request<Body>| {
-                        let authentication = authentication.clone();
-                        async move {
-                            handle_request(
-                                rfb_addr,
-                                req,
-                                remote_addr,
-                                authentication.clone(),
-                                enable_audio,
-                            )
-                            .await
-                        }
-                    }))
-                }
-            },
-        ));
-        log::info!("Listening on: {}", local_addr);
+    // ensure rfb server can be connected
+    let mut socket = TcpStream::connect(rfb_addr).await?;
+    socket.shutdown().await?;
 
-        server.await?;
-    } else {
-        let listener = TcpListener::bind(&local_addr).await?;
-        log::info!("Listening on: {}", local_addr);
+    let listener = TcpListener::bind(&local_addr).await?;
+    log::info!("Listening on: {}", local_addr);
 
-        while let Ok((raw_stream, remote_addr)) = listener.accept().await {
-            // check if remote ip is allowed to connect
-            if matches.value_of("allow").is_some() {
-                if remote_addr.ip().to_string() != matches.value_of("allow").unwrap().to_string() {
-                    log::error!("{} not allowed", remote_addr);
-                    continue;
-                }
+    while let Ok((raw_stream, remote_addr)) = listener.accept().await {
+        // check if remote ip is allowed to connect
+        if matches.value_of("allow").is_some() {
+            if remote_addr.ip().to_string() != matches.value_of("allow").unwrap().to_string() {
+                log::error!("{} not allowed", remote_addr);
+                continue;
             }
-            let ws_stream = match tokio_tungstenite::accept_hdr_async(
-                raw_stream,
-                |request: &tungstenite::handshake::server::Request,
-                 mut response: tungstenite::handshake::server::Response| {
-                    const PROTOCOL_HEADER: &str = "Sec-WebSocket-Protocol";
-                    if let Some(val) = request.headers().get(PROTOCOL_HEADER) {
-                        response.headers_mut().insert(PROTOCOL_HEADER, val.clone());
-                    }
-                    Ok(response)
-                },
-            )
-            .await
-            {
-                Ok(ws_stream) => ws_stream,
-                Err(e) => {
-                    log::error!("error in websocket upgrade: {:#}", e);
-                    continue;
-                }
-            };
-            let authentication = authentication.clone();
-            tokio::spawn(async move {
-                log::info!("Incoming TCP connection from: {}", remote_addr);
-                if let Err(e) =
-                    handle_connection(rfb_addr, ws_stream, &authentication, enable_audio).await
-                {
-                    log::error!("error in websocket connection: {:#}", e);
-                }
-                log::info!("{} disconnected", remote_addr);
-            });
         }
+        
+        let authentication = authentication.clone();
+        raw_stream.set_nodelay(true).expect("set_nodelay call failed");
+        tokio::spawn(async move {
+            log::info!("Incoming TCP connection from: {}", remote_addr);
+            if let Err(e) =
+                handle_connection::<tokio::net::TcpStream>(rfb_addr, raw_stream, &authentication, enable_audio).await
+            {
+                log::error!("error in client connection: {:#}", e);
+            }
+            log::info!("{} disconnected", remote_addr);
+        });
     }
-
+    
     Ok(())
 }
